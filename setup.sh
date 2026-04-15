@@ -2,8 +2,10 @@
 
 # ================================================================
 #  ALL-IN-ONE INSTALLER: OpenSSH Server + ISC DHCP Server
-#  FIX STUCK   : Auto kill saat stuck di "100%" header
-#                (sama seperti Ctrl+C manual)
+#  FIX UTAMA 1 : apt-get update  → auto kill saat stuck 100%
+#  FIX UTAMA 2 : apt-get install → auto kill saat stuck di
+#                "Processing triggers for systemd" (Debian 8 bug)
+#                Package sudah terinstall = aman di-kill
 #  Compatible  : Debian 8 (Jessie) / Debian 13 (Trixie)
 #  VirtualBox  : Adapter1=Host-Only | Adapter2=NAT
 # ================================================================
@@ -25,6 +27,7 @@ NC='\033[0m'
 # ─────────────────────────────────────────
 IP_SAVE_FILE="/root/.aio_server_ip"
 APT_LOG="/tmp/apt_aio.log"
+INSTALL_LOG="/tmp/install_aio.log"
 STEP_LOG="/root/aio_steps.log"
 
 # ─────────────────────────────────────────
@@ -56,6 +59,123 @@ slow_msg() {
 }
 
 # ─────────────────────────────────────────
+#  FUNGSI INSTALL DENGAN AUTO-KILL SYSTEMD HANG
+#  Fix untuk Debian 8 bug:
+#  "Processing triggers for systemd" → hang selamanya
+#  Padahal package sudah terinstall sempurna
+# ─────────────────────────────────────────
+safe_apt_install() {
+    local PACKAGE="$1"
+    local LOGFILE="$2"
+    local TIMEOUT_SEC=120
+
+    # Variabel untuk detect trigger systemd hang
+    local STUCK_TRIGGER_LIMIT=4   # 4x cek tidak berubah = stuck
+    local CHECK_INTERVAL=3        # cek setiap 3 detik
+    local ELAPSED=0
+    local SAME_COUNT=0
+    local LAST_SIZE=0
+
+    > "$LOGFILE"
+
+    blank
+    echo -e "  ${BOLD}${YELLOW}── apt-get install $PACKAGE (output live) ──${NC}"
+    echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
+
+    # Jalankan apt-get install di background
+    DEBIAN_FRONTEND=noninteractive \
+    SYSTEMD_IGNORE_CHROOT=1 \
+    apt-get install -y "$PACKAGE" \
+        2>&1 | tee "$LOGFILE" | sed 's/^/  /' &
+
+    local INSTALL_PID=$!
+    local KILLED_BY_WATCHDOG=false
+
+    # ── WATCHDOG LOOP ──
+    while kill -0 "$INSTALL_PID" 2>/dev/null; do
+        sleep $CHECK_INTERVAL
+        ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+
+        CURRENT_SIZE=$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)
+
+        # Deteksi kondisi "Setting up PACKAGE" sudah muncul
+        # = package sudah selesai diinstall
+        PKG_SETUP_DONE=false
+        if grep -q "Setting up $PACKAGE" "$LOGFILE" 2>/dev/null; then
+            PKG_SETUP_DONE=true
+        fi
+
+        # Deteksi line trigger systemd yang menyebabkan hang
+        TRIGGER_SYSTEMD=false
+        if grep -q "Processing triggers for systemd" "$LOGFILE" 2>/dev/null; then
+            TRIGGER_SYSTEMD=true
+        fi
+
+        if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
+            SAME_COUNT=$((SAME_COUNT + 1))
+
+            # ── KONDISI KILL: package sudah setup DAN output berhenti ──
+            if [ "$PKG_SETUP_DONE" = true ] && \
+               [ "$SAME_COUNT" -ge "$STUCK_TRIGGER_LIMIT" ]; then
+                blank
+                if [ "$TRIGGER_SYSTEMD" = true ]; then
+                    echo -e "  ${YELLOW}[WATCHDOG]${NC} Terdeteksi stuck di:"
+                    echo -e "  ${YELLOW}           ${NC} 'Processing triggers for systemd'"
+                    echo -e "  ${YELLOW}[WATCHDOG]${NC} Ini bug Debian 8 yang diketahui"
+                else
+                    echo -e "  ${YELLOW}[WATCHDOG]${NC} Output berhenti ${STUCK_TRIGGER_LIMIT}x berturut"
+                fi
+                echo -e "  ${GREEN}[WATCHDOG]${NC} '$PACKAGE' sudah terinstall sempurna"
+                echo -e "  ${GREEN}[WATCHDOG]${NC} Auto-kill (sama seperti Ctrl+C manual) ✓"
+
+                # Kill seluruh process group
+                kill "$INSTALL_PID"        2>/dev/null
+                kill $(pgrep -P "$INSTALL_PID") 2>/dev/null
+                pkill -P "$INSTALL_PID"   2>/dev/null
+                wait "$INSTALL_PID"        2>/dev/null
+                KILLED_BY_WATCHDOG=true
+                break
+            fi
+
+        else
+            SAME_COUNT=0
+        fi
+
+        LAST_SIZE=$CURRENT_SIZE
+
+        # Hard timeout
+        if [ "$ELAPSED" -ge "$TIMEOUT_SEC" ]; then
+            blank
+            warn "[WATCHDOG] Timeout ${TIMEOUT_SEC}s tercapai → Force kill"
+            kill "$INSTALL_PID"             2>/dev/null
+            kill $(pgrep -P "$INSTALL_PID") 2>/dev/null
+            wait "$INSTALL_PID"             2>/dev/null
+            KILLED_BY_WATCHDOG=true
+            break
+        fi
+    done
+
+    wait "$INSTALL_PID" 2>/dev/null
+    local EXIT_CODE=$?
+
+    echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
+    blank
+
+    # ── CEK APAKAH PACKAGE BENAR-BENAR TERINSTALL ──
+    if dpkg -l 2>/dev/null | grep -qw "$PACKAGE"; then
+        if [ "$KILLED_BY_WATCHDOG" = true ]; then
+            success "$PACKAGE terinstall ✓ (auto-kill dari systemd hang)"
+        else
+            success "$PACKAGE terinstall ✓ (normal)"
+        fi
+        return 0
+    else
+        error "$PACKAGE GAGAL terinstall!"
+        return 1
+    fi
+}
+
+# ─────────────────────────────────────────
 #  BANNER
 # ─────────────────────────────────────────
 banner() {
@@ -65,9 +185,10 @@ banner() {
     echo "  ║     AIO: OpenSSH + ISC DHCP Server Installer      ║"
     echo "  ╠════════════════════════════════════════════════════╣"
     echo "  ║  Debian 8 (Jessie) / Debian 13 (Trixie)           ║"
-    echo "  ║  FIX: Auto kill apt saat stuck di header 100%     ║"
-    echo "  ║  Repo : Cek hidup otomatis + fallback             ║"
-    echo "  ║  IP   : Tersimpan, tidak random ulang             ║"
+    echo "  ║  FIX 1: apt-get update  → auto kill stuck 100%   ║"
+    echo "  ║  FIX 2: apt-get install → auto kill systemd hang  ║"
+    echo "  ║  Repo  : Cek hidup otomatis + fallback            ║"
+    echo "  ║  IP    : Tersimpan, tidak random ulang            ║"
     echo "  ╚════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     sleep 0.8
@@ -196,8 +317,7 @@ Acquire::AllowDowngradeToInsecureRepositories "true";
 APT::Get::AllowUnauthenticated "true";
 ANTISTUCK
 
-success "APT config anti-stuck dipasang ✓"
-info "ForceIPv4, Timeout=15s, Pipeline-Depth=0"
+success "APT anti-stuck config dipasang ✓"
 
 # ══════════════════════════════════════════
 # STEP 4 - CEK INTERNET
@@ -241,13 +361,10 @@ check_repo() {
             "$URL" > /dev/null 2>&1
         RESULT=$?
     fi
-
     if [ $RESULT -eq 0 ]; then
-        echo -e "${GREEN}→ HIDUP ✓${NC}"
-        return 0
+        echo -e "${GREEN}→ HIDUP ✓${NC}"; return 0
     else
-        echo -e "${RED}→ MATI ✗${NC}"
-        return 1
+        echo -e "${RED}→ MATI ✗${NC}";   return 1
     fi
 }
 
@@ -258,11 +375,11 @@ cp /etc/apt/sources.list \
 
 if [ "$DISTRO" = "debian8" ]; then
     check_repo "http://kambing.ui.ac.id/debian/"   \
-        "kambing.ui.ac.id  "                        && REPO_KAMBING=true  || REPO_KAMBING=false
+        "kambing.ui.ac.id  " && REPO_KAMBING=true  || REPO_KAMBING=false
     check_repo "http://archive.debian.org/debian/" \
-        "archive.debian.org"                        && REPO_ARCHIVE=true  || REPO_ARCHIVE=false
+        "archive.debian.org" && REPO_ARCHIVE=true  || REPO_ARCHIVE=false
     check_repo "http://ftp.id.debian.org/debian/"  \
-        "ftp.id.debian.org "                        && REPO_FTPID=true    || REPO_FTPID=false
+        "ftp.id.debian.org " && REPO_FTPID=true    || REPO_FTPID=false
 
     blank
     REPO_COUNT=0
@@ -302,15 +419,14 @@ EOF
     fi
 
 else
-    check_repo "http://deb.debian.org/debian/"             \
-        "deb.debian.org    "                               && REPO_DEBMAIN=true || REPO_DEBMAIN=false
-    check_repo "http://ftp.debian.org/debian/"             \
-        "ftp.debian.org    "                               && REPO_FTPDEB=true  || REPO_FTPDEB=false
-    check_repo "http://security.debian.org/debian-security"\
-        "security.debian.org"                              && REPO_SECDEB=true  || REPO_SECDEB=false
+    check_repo "http://deb.debian.org/debian/"              \
+        "deb.debian.org    " && REPO_DEBMAIN=true || REPO_DEBMAIN=false
+    check_repo "http://ftp.debian.org/debian/"              \
+        "ftp.debian.org    " && REPO_FTPDEB=true  || REPO_FTPDEB=false
+    check_repo "http://security.debian.org/debian-security" \
+        "security.debian.org" && REPO_SECDEB=true || REPO_SECDEB=false
 
     blank
-
     if   [ "$REPO_DEBMAIN" = true ]; then
         MAIN_MIRROR="http://deb.debian.org/debian/"
         success "Mirror utama: deb.debian.org"
@@ -319,7 +435,7 @@ else
         success "Mirror utama: ftp.debian.org (fallback)"
     else
         MAIN_MIRROR="http://deb.debian.org/debian/"
-        warn "Semua mirror timeout - paksa deb.debian.org"
+        warn "Semua timeout - paksa deb.debian.org"
     fi
 
     cat > /etc/apt/sources.list << REPOEOF
@@ -339,31 +455,20 @@ blank
 success "sources.list selesai dikonfigurasi"
 
 # ══════════════════════════════════════════
-# STEP 6 - APT-GET UPDATE (FIX STUCK 100%)
+# STEP 6 - APT-GET UPDATE (WATCHDOG)
 # ══════════════════════════════════════════
-step "STEP 6/17 ► apt-get update (Auto Kill saat stuck 100%)"
+step "STEP 6/17 ► apt-get update (Watchdog Mode)"
 
-# ─────────────────────────────────────────────────────
-#  PENJELASAN FIX:
-#  apt-get update kadang stuck di "100% [Working]" atau
-#  "Reading package lists... 100%" padahal semua file
-#  sudah selesai didownload.
-#  Solusinya = deteksi ketika tidak ada baris baru
-#  selama N detik → auto kill (sama seperti Ctrl+C manual)
-#  Data sudah aman karena sudah ter-download semua.
-# ─────────────────────────────────────────────────────
-
-# Bersihkan lock + lists lama
 slow_msg "Bersihkan apt lock files"
-rm -f /var/lib/apt/lists/lock         2>/dev/null
-rm -f /var/cache/apt/archives/lock    2>/dev/null
-rm -f /var/lib/dpkg/lock              2>/dev/null
-rm -f /var/lib/dpkg/lock-frontend     2>/dev/null
-dpkg --configure -a                    2>/dev/null
+rm -f /var/lib/apt/lists/lock        2>/dev/null
+rm -f /var/cache/apt/archives/lock   2>/dev/null
+rm -f /var/lib/dpkg/lock             2>/dev/null
+rm -f /var/lib/dpkg/lock-frontend    2>/dev/null
+dpkg --configure -a                   2>/dev/null
 
 slow_msg "Bersihkan package lists lama"
-rm -rf /var/lib/apt/lists/*            2>/dev/null
-mkdir -p /var/lib/apt/lists/partial    2>/dev/null
+rm -rf /var/lib/apt/lists/*           2>/dev/null
+mkdir -p /var/lib/apt/lists/partial   2>/dev/null
 
 > "$APT_LOG"
 
@@ -371,10 +476,6 @@ blank
 echo -e "  ${BOLD}${YELLOW}── apt-get update OUTPUT (live) ──${NC}"
 echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
 
-# ─────────────────────────────────────────
-# Jalankan apt-get update di background
-# Pipe output ke log DAN terminal langsung
-# ─────────────────────────────────────────
 if [ "$DISTRO" = "debian8" ]; then
     apt-get update \
         --allow-unauthenticated \
@@ -394,116 +495,68 @@ else
         2>&1 | tee "$APT_LOG" | sed 's/^/  /' &
 fi
 
-# PID dari pipe pertama (apt-get)
 APT_PID=$!
-
-# ─────────────────────────────────────────
-#  WATCHDOG: Monitor log, kill jika stuck
-#  Logic:
-#  1. Catat ukuran log setiap 3 detik
-#  2. Jika ukuran TIDAK BERUBAH selama 8 detik
-#     DAN sudah ada baris Get/Hit (artinya 100% selesai)
-#     → Kill otomatis (seperti Ctrl+C)
-#  3. Jika total waktu > 120 detik → Kill paksa
-# ─────────────────────────────────────────
-WATCH_INTERVAL=3        # cek setiap N detik
-STUCK_LIMIT=3           # berapa kali ukuran sama = stuck (3x3=9 detik)
-MAX_WAIT=120            # maksimum total detik
+WATCH_INTERVAL=3
+STUCK_LIMIT=3
+MAX_WAIT=120
 ELAPSED=0
 SAME_COUNT=0
 LAST_SIZE=0
+APT_KILLED=false
 
 while kill -0 "$APT_PID" 2>/dev/null; do
     sleep $WATCH_INTERVAL
     ELAPSED=$((ELAPSED + WATCH_INTERVAL))
-
-    # Ambil ukuran log saat ini
     CURRENT_SIZE=$(wc -c < "$APT_LOG" 2>/dev/null || echo 0)
-
-    # Cek apakah sudah ada download (Hit/Get)
     HAS_DOWNLOAD=false
-    if grep -qE "^(Hit|Get)" "$APT_LOG" 2>/dev/null; then
-        HAS_DOWNLOAD=true
-    fi
+    grep -qE "^(Hit|Get)" "$APT_LOG" 2>/dev/null && HAS_DOWNLOAD=true
 
     if [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
-        # Ukuran tidak berubah
         SAME_COUNT=$((SAME_COUNT + 1))
-
-        if [ "$HAS_DOWNLOAD" = true ] && [ "$SAME_COUNT" -ge "$STUCK_LIMIT" ]; then
-            # ── STUCK DI 100% ── Kill seperti Ctrl+C
+        if [ "$HAS_DOWNLOAD" = true ] && \
+           [ "$SAME_COUNT" -ge "$STUCK_LIMIT" ]; then
             blank
-            echo -e "  ${YELLOW}[WATCHDOG]${NC} Output tidak berubah ${STUCK_LIMIT}x (${STUCK_LIMIT}x${WATCH_INTERVAL}s)"
-            echo -e "  ${YELLOW}[WATCHDOG]${NC} Download sudah selesai (ada Hit/Get)"
-            echo -e "  ${GREEN}[WATCHDOG]${NC} Auto-kill apt (sama seperti Ctrl+C manual) ✓"
+            echo -e "  ${YELLOW}[WATCHDOG]${NC} Stuck terdeteksi → Auto kill ✓"
             kill "$APT_PID" 2>/dev/null
-            # Kill seluruh process group pipe
             kill $(pgrep -P "$APT_PID") 2>/dev/null
             wait "$APT_PID" 2>/dev/null
-            APT_KILLED_BY_WATCHDOG=true
+            APT_KILLED=true
             break
         fi
-
-        if [ "$SAME_COUNT" -ge "$STUCK_LIMIT" ] && [ "$HAS_DOWNLOAD" = false ]; then
-            # Stuck tapi belum ada download sama sekali - mungkin koneksi bermasalah
-            blank
-            warn "[WATCHDOG] Tidak ada aktivitas download sama sekali"
-            warn "[WATCHDOG] Mungkin repo tidak bisa dijangkau"
-        fi
     else
-        # Ada perubahan, reset counter
         SAME_COUNT=0
     fi
 
     LAST_SIZE=$CURRENT_SIZE
 
-    # Hard timeout
     if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-        blank
-        warn "[WATCHDOG] Batas waktu maksimum ${MAX_WAIT}s tercapai"
-        warn "[WATCHDOG] Force kill apt-get"
+        warn "[WATCHDOG] Timeout → Force kill"
         kill "$APT_PID" 2>/dev/null
-        kill $(pgrep -P "$APT_PID") 2>/dev/null
         wait "$APT_PID" 2>/dev/null
-        APT_KILLED_BY_WATCHDOG=true
+        APT_KILLED=true
         break
     fi
 done
 
-# Tunggu proses benar-benar selesai
 wait "$APT_PID" 2>/dev/null
-APT_EXIT=$?
 
 echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
 blank
 
-# ── EVALUASI HASIL ──
-if [ "$APT_KILLED_BY_WATCHDOG" = true ]; then
-    # Kill oleh watchdog = stuck di 100% = sudah selesai
-    success "apt-get update selesai (auto-kill dari stuck 100%) ✓"
-    success "Semua package list sudah terdownload dengan benar"
-elif [ "$APT_EXIT" -eq 0 ]; then
-    success "apt-get update BERHASIL normal ✓"
+if [ "$APT_KILLED" = true ]; then
+    success "apt-get update selesai (auto-kill dari stuck) ✓"
 elif grep -qE "^(Hit|Get)" "$APT_LOG" 2>/dev/null; then
-    success "apt-get update selesai (ada Hit/Get) ✓"
-    warn "Ada beberapa error kecil (tidak fatal)"
+    success "apt-get update selesai ✓"
 else
-    error "apt-get update gagal, tidak ada repo yang bisa diakses"
-    warn "Melanjutkan script (paket mungkin di cache)"
+    warn "apt-get update mungkin ada error, lanjut..."
 fi
 
-# ── RINGKASAN ──
 if [ -f "$APT_LOG" ]; then
-    HIT=$(grep -c "^Hit"  "$APT_LOG" 2>/dev/null || echo 0)
-    GET=$(grep -c "^Get"  "$APT_LOG" 2>/dev/null || echo 0)
-    IGN=$(grep -c "^Ign"  "$APT_LOG" 2>/dev/null || echo 0)
-    ERR=$(grep -c "^Err"  "$APT_LOG" 2>/dev/null || echo 0)
-    blank
-    echo -e "  Ringkasan Update:"
-    echo -e "  ${GREEN}Hit (cache ok) : $HIT${NC}"
-    echo -e "  ${CYAN}Get (downloaded): $GET${NC}"
-    echo -e "  ${YELLOW}Ign (ignored)  : $IGN${NC}"
-    echo -e "  ${RED}Err (errors)   : $ERR${NC}"
+    HIT=$(grep -c "^Hit" "$APT_LOG" 2>/dev/null || echo 0)
+    GET=$(grep -c "^Get" "$APT_LOG" 2>/dev/null || echo 0)
+    IGN=$(grep -c "^Ign" "$APT_LOG" 2>/dev/null || echo 0)
+    ERR=$(grep -c "^Err" "$APT_LOG" 2>/dev/null || echo 0)
+    echo -e "  ${GREEN}Hit=$HIT${NC}  ${CYAN}Get=$GET${NC}  ${YELLOW}Ign=$IGN${NC}  ${RED}Err=$ERR${NC}"
 fi
 
 # ══════════════════════════════════════════
@@ -519,11 +572,12 @@ dpkg -l 2>/dev/null | grep -qw "openssh-client"  && SSH_PKG_FOUND=true
 
 if [ "$SSH_PKG_FOUND" = true ]; then
     warn "OpenSSH ditemukan → Hapus semua jejak..."
+
     slow_msg "Stop service SSH"
-    systemctl stop ssh      2>/dev/null
-    systemctl disable ssh   2>/dev/null
-    service ssh stop        2>/dev/null
-    pkill -x sshd           2>/dev/null
+    systemctl stop ssh    2>/dev/null
+    systemctl disable ssh 2>/dev/null
+    service ssh stop      2>/dev/null
+    pkill -x sshd         2>/dev/null
     sleep 1
 
     slow_msg "Remove + purge openssh"
@@ -531,9 +585,9 @@ if [ "$SSH_PKG_FOUND" = true ]; then
     apt-get remove --purge -y \
         openssh-server openssh-client \
         openssh-sftp-server > /dev/null 2>&1
-    apt-get autoremove -y   > /dev/null 2>&1
+    apt-get autoremove -y > /dev/null 2>&1
 
-    slow_msg "Hapus file config SSH"
+    slow_msg "Hapus file config"
     rm -rf /etc/ssh/sshd_config \
            /etc/ssh/ssh_config  \
            /etc/ssh/ssh_host_*  \
@@ -558,6 +612,7 @@ dpkg -l 2>/dev/null | grep -qw "isc-dhcp-common"  && DHCP_PKG_FOUND=true
 
 if [ "$DHCP_PKG_FOUND" = true ]; then
     warn "ISC DHCP ditemukan → Hapus semua jejak..."
+
     slow_msg "Stop service DHCP"
     systemctl stop isc-dhcp-server    2>/dev/null
     systemctl disable isc-dhcp-server 2>/dev/null
@@ -572,7 +627,7 @@ if [ "$DHCP_PKG_FOUND" = true ]; then
         isc-dhcp-client > /dev/null 2>&1
     apt-get autoremove -y > /dev/null 2>&1
 
-    slow_msg "Hapus file config DHCP"
+    slow_msg "Hapus file config"
     rm -rf /etc/dhcp/dhcpd.conf        \
            /etc/dhcp/dhcpd6.conf       \
            /var/lib/dhcp/*             \
@@ -585,28 +640,18 @@ else
 fi
 
 # ══════════════════════════════════════════
-# STEP 9 - INSTALL OPENSSH
+# STEP 9 - INSTALL OPENSSH (SAFE MODE)
 # ══════════════════════════════════════════
-step "STEP 9/17 ► Install OpenSSH Server"
+step "STEP 9/17 ► Install OpenSSH Server (Safe Mode)"
 
-slow_msg "Mulai install openssh-server"
-blank
-echo -e "  ${BOLD}${YELLOW}── apt-get install openssh-server OUTPUT ──${NC}"
-echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
-
-DEBIAN_FRONTEND=noninteractive \
-timeout 180 apt-get install -y openssh-server \
-    2>&1 | sed 's/^/  /'
-INSTALL_SSH_EXIT=${PIPESTATUS[0]}
-
-echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
+info "Mode: Auto-kill jika stuck di 'Processing triggers for systemd'"
 blank
 
-if ! dpkg -l 2>/dev/null | grep -qw "openssh-server"; then
-    error "openssh-server GAGAL terinstall!"
+safe_apt_install "openssh-server" "$INSTALL_LOG"
+if [ $? -ne 0 ]; then
+    error "openssh-server GAGAL terinstall! Cek koneksi internet."
     exit 1
 fi
-success "openssh-server BERHASIL diinstall ✓"
 
 # ══════════════════════════════════════════
 # STEP 10 - KONFIGURASI SSH
@@ -643,7 +688,6 @@ UsePAM yes
 ClientAliveInterval 120
 ClientAliveCountMax 3
 TCPKeepAlive yes
-
 PrintMotd no
 PrintLastLog yes
 X11Forwarding yes
@@ -658,28 +702,18 @@ ssh-keygen -A > /dev/null 2>&1
 success "SSH Host Keys generated ✓"
 
 # ══════════════════════════════════════════
-# STEP 11 - INSTALL ISC DHCP
+# STEP 11 - INSTALL ISC DHCP (SAFE MODE)
 # ══════════════════════════════════════════
-step "STEP 11/17 ► Install ISC DHCP Server"
+step "STEP 11/17 ► Install ISC DHCP Server (Safe Mode)"
 
-slow_msg "Mulai install isc-dhcp-server"
-blank
-echo -e "  ${BOLD}${YELLOW}── apt-get install isc-dhcp-server OUTPUT ──${NC}"
-echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
-
-DEBIAN_FRONTEND=noninteractive \
-timeout 180 apt-get install -y isc-dhcp-server \
-    2>&1 | sed 's/^/  /'
-INSTALL_DHCP_EXIT=${PIPESTATUS[0]}
-
-echo -e "  ${BLUE}────────────────────────────────────────────${NC}"
+info "Mode: Auto-kill jika stuck di 'Processing triggers for systemd'"
 blank
 
-if ! dpkg -l 2>/dev/null | grep -qw "isc-dhcp-server"; then
+safe_apt_install "isc-dhcp-server" "$INSTALL_LOG"
+if [ $? -ne 0 ]; then
     error "isc-dhcp-server GAGAL terinstall!"
     exit 1
 fi
-success "isc-dhcp-server BERHASIL diinstall ✓"
 
 # ══════════════════════════════════════════
 # STEP 12 - KONFIGURASI DHCP INTERFACE
@@ -688,7 +722,6 @@ step "STEP 12/17 ► Set Interface DHCP"
 slow_msg "Menulis /etc/default/isc-dhcp-server"
 
 DHCP_DEFAULT="/etc/default/isc-dhcp-server"
-
 if [ "$DISTRO" = "debian8" ]; then
     cat > "$DHCP_DEFAULT" << DEFEOF
 # AIO Script - Debian 8
@@ -784,7 +817,8 @@ dns=$DNS_PRIMARY;$DNS_SECONDARY;
 [ipv6]
 method=ignore
 NMEOF
-    chmod 600 /etc/NetworkManager/system-connections/aio-lan.nmconnection
+    chmod 600 \
+        /etc/NetworkManager/system-connections/aio-lan.nmconnection
     success "NM connection file dibuat ✓"
 fi
 
@@ -871,48 +905,48 @@ ACTIVE_IP=$(ip addr show "$IFACE_LAN" 2>/dev/null \
 SSH_VER=$(sshd -V 2>&1 | grep -oP 'OpenSSH_[^\s,]+' | head -1)
 
 blank
-echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${BLUE}║           LAPORAN INSTALASI SELESAI                      ║${NC}"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║             LAPORAN INSTALASI SELESAI                      ║${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${WHITE}[OS INFO]${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    OS             : ${GREEN}$DISTRO_NAME${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    OpenSSH        : ${GREEN}${SSH_VER:-openssh-server}${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Internet       : ${GREEN}$INTERNET_OK${NC}"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${WHITE}[STATUS SERVICE]${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    OpenSSH Server : $(echo -e $SSH_STATUS)"
 echo -e "${BOLD}${BLUE}║${NC}    ISC DHCP Server: $(echo -e $DHCP_STATUS)"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${WHITE}[NETWORK]${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    LAN Interface  : ${GREEN}$IFACE_LAN${NC} (Host-Only Adapter 1)"
-echo -e "${BOLD}${BLUE}║${NC}    WAN Interface  : ${GREEN}$IFACE_WAN${NC} (NAT Adapter 2)"
+echo -e "${BOLD}${BLUE}║${NC}    WAN Interface  : ${GREEN}$IFACE_WAN${NC} (NAT        Adapter 2)"
 echo -e "${BOLD}${BLUE}║${NC}    Server IP      : ${YELLOW}$SERVER_IP${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    IP Aktif       : ${CYAN}${ACTIVE_IP:-Belum assign}${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Netmask        : ${GREEN}$SUBNET_MASK${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Broadcast      : ${GREEN}$BROADCAST${NC}"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${WHITE}[DHCP POOL]${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Range          : ${GREEN}$RANGE_START${NC} s/d ${GREEN}$RANGE_END${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Total Host     : ${GREEN}50 Host${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Gateway Client : ${GREEN}$SERVER_IP${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    DNS            : ${GREEN}$DNS_PRIMARY / $DNS_SECONDARY${NC}"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${WHITE}[KONEKSI SSH]${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Host/IP  : ${YELLOW}$SERVER_IP${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    Port     : ${YELLOW}22${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    User     : ${YELLOW}root${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    CMD/PS   : ${CYAN}ssh root@$SERVER_IP${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    PuTTY    : ${CYAN}Host=$SERVER_IP | Port=22 | SSH${NC}"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${WHITE}[CEK MANUAL SETELAH REBOOT]${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    ${CYAN}systemctl status ssh${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    ${CYAN}systemctl status isc-dhcp-server${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    ${CYAN}ip addr show $IFACE_LAN${NC}"
 echo -e "${BOLD}${BLUE}║${NC}    ${CYAN}cat /var/lib/dhcp/dhcpd.leases${NC}"
-echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${GREEN}✓ INSTALASI SELESAI!${NC}"
 echo -e "${BOLD}${BLUE}║${NC}  ${YELLOW}⚠ Reboot dianjurkan: ${CYAN}reboot${NC}"
-echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
 blank
 
 LOG_FINAL="/root/aio_install_$(date +%Y%m%d_%H%M%S).log"
@@ -924,8 +958,8 @@ LOG_FINAL="/root/aio_install_$(date +%Y%m%d_%H%M%S).log"
     echo "Range    : $RANGE_START - $RANGE_END"
     echo "LAN      : $IFACE_LAN"
     echo "WAN      : $IFACE_WAN"
-    echo "SSH      : $(pgrep -x sshd  > /dev/null 2>&1 && echo RUNNING || echo STOPPED)"
-    echo "DHCP     : $(pgrep -x dhcpd > /dev/null 2>&1 && echo RUNNING || echo STOPPED)"
+    echo "SSH      : $(pgrep -x sshd  >/dev/null 2>&1 && echo RUNNING || echo STOPPED)"
+    echo "DHCP     : $(pgrep -x dhcpd >/dev/null 2>&1 && echo RUNNING || echo STOPPED)"
 } > "$LOG_FINAL"
 
 echo -e "  ${CYAN}[i] Log: $LOG_FINAL${NC}"
