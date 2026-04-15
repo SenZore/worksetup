@@ -3,14 +3,14 @@
 #  AUTHOR    : ADAM SANJAYA XI TJKT 2
 #  PROJECT   : OpenSSH + ISC-DHCP Server — FULL FRESH SETUP
 #  TARGET    : Debian 13 (Trixie) — VirtualBox
-#  ADAPTER 1 : Host-Only  → DHCP Server (auto-detected)
-#  ADAPTER 2 : NAT        → Internet/packages (auto-detected)
-#  DHCP RANGE: auto-detected subnet, .50–.100 (51 hosts)
+#  ADAPTER 1 : enp0s3  → Host-Only  → DHCP Server
+#  ADAPTER 2 : enp0s8  → NAT        → Internet
+#  SERVER IP : 192.168.56.1
+#  DHCP RANGE: 192.168.56.50 – 192.168.56.100
 # ============================================================
 
 [[ $EUID -ne 0 ]] && { echo "[ERROR] Run as root: sudo bash setup_adam.sh"; exit 1; }
 
-# ── Colors ───────────────────────────────────────────────────
 G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; R='\033[0;31m'; N='\033[0m'
 info()    { echo -e "\n${C}[INFO]${N}  $1"; }
 success() { echo -e "${G}[OK]${N}    $1"; }
@@ -18,111 +18,63 @@ warn()    { echo -e "${Y}[WARN]${N}  $1"; }
 error()   { echo -e "${R}[ERR]${N}   $1"; exit 1; }
 banner()  { echo -e "\n${Y}══════════════════════════════════════════${N}\n  $1\n${Y}══════════════════════════════════════════${N}"; }
 
-clear
-echo ""
-echo "  ╔══════════════════════════════════════════════════════╗"
-echo "  ║       ADAM SANJAYA XI TJKT 2 — FRESH SETUP          ║"
-echo "  ║       OpenSSH + ISC-DHCP | Debian 13 | VirtualBox   ║"
-echo "  ║       Adapter 1: Host-Only | Adapter 2: NAT         ║"
-echo "  ╚══════════════════════════════════════════════════════╝"
-echo ""
+# ── Fixed interface + network config ─────────────────────────
+HOSTONLY="enp0s3"         # Adapter 1 — Host-Only — DHCP server
+NAT="enp0s8"              # Adapter 2 — NAT       — internet
 
-# ════════════════════════════════════════════════════════════
-#  PHASE 1 — AUTO-DETECT INTERFACES
-# ════════════════════════════════════════════════════════════
-banner "PHASE 1 — DETECTING INTERFACES"
-
-info "Bringing up all interfaces to scan..."
-for iface in $(ls /sys/class/net | grep -v lo); do
-  ip link set "$iface" up 2>/dev/null
-done
-sleep 1
-
-# Try to get IPs via DHCP on all non-loopback interfaces
-info "Requesting DHCP leases on all interfaces..."
-for iface in $(ls /sys/class/net | grep -v lo); do
-  dhclient "$iface" 2>/dev/null &
-done
-sleep 4
-kill %% 2>/dev/null; wait 2>/dev/null
-
-info "Scanning interfaces..."
-
-NAT_IFACE=""
-HOSTONLY_IFACE=""
-
-# The NAT interface will have a default route / gateway assigned
-# The Host-Only interface will have an IP but no gateway
-
-for iface in $(ls /sys/class/net | grep -v lo); do
-  IP=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
-  GW=$(ip route show dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -1)
-
-  [[ -z "$IP" ]] && continue
-
-  echo "    Found: $iface → IP=$IP  GW=${GW:-none}"
-
-  if [[ -n "$GW" ]]; then
-    NAT_IFACE="$iface"
-    NAT_IP="$IP"
-  else
-    HOSTONLY_IFACE="$iface"
-    HOSTONLY_CURRENT_IP="$IP"
-  fi
-done
-
-# Fallback: if only one interface found, ask
-[[ -z "$NAT_IFACE" ]]     && error "Could not detect NAT interface (Adapter 2). Make sure Adapter 2 is set to NAT in VirtualBox."
-[[ -z "$HOSTONLY_IFACE" ]] && error "Could not detect Host-Only interface (Adapter 1). Make sure Adapter 1 is set to Host-Only in VirtualBox."
-
-success "NAT interface      : $NAT_IFACE  (IP: $NAT_IP)"
-success "Host-Only interface: $HOSTONLY_IFACE  (current IP: $HOSTONLY_CURRENT_IP)"
-
-# ── Derive subnet from Host-Only interface's current IP ──────
-# e.g. 192.168.56.101 → base = 192.168.56, server = 192.168.56.1
-IFACE="$HOSTONLY_IFACE"
-BASE_SUBNET=$(echo "$HOSTONLY_CURRENT_IP" | cut -d. -f1-3)   # e.g. 192.168.56
-
-SERVER_IP="${BASE_SUBNET}.1"
-SUBNET="${BASE_SUBNET}.0"
+SERVER_IP="192.168.56.1"
+SUBNET="192.168.56.0"
 NETMASK="255.255.255.0"
 PREFIX="24"
-BROADCAST="${BASE_SUBNET}.255"
-RANGE_START="${BASE_SUBNET}.50"
-RANGE_END="${BASE_SUBNET}.100"
+BROADCAST="192.168.56.255"
+RANGE_START="192.168.56.50"
+RANGE_END="192.168.56.100"
 DNS1="8.8.8.8"
 DNS2="8.8.4.4"
 DEFAULT_LEASE="3600"
 MIN_LEASE="600"
 MAX_LEASE="7200"
 
+clear
 echo ""
-echo -e "  ${C}Subnet detected  :${N} $SUBNET/24"
-echo -e "  ${C}Server IP will be:${N} $SERVER_IP"
-echo -e "  ${C}DHCP range       :${N} $RANGE_START – $RANGE_END  (51 hosts)"
+echo "  ╔══════════════════════════════════════════════════════╗"
+echo "  ║       ADAM SANJAYA XI TJKT 2 — FRESH SETUP          ║"
+echo "  ║       OpenSSH + ISC-DHCP | Debian 13 | VirtualBox   ║"
+echo "  ╠══════════════════════════════════════════════════════╣"
+echo "  ║  Adapter 1 : enp0s3  →  Host-Only  (DHCP Server)    ║"
+echo "  ║  Adapter 2 : enp0s8  →  NAT        (Internet)       ║"
+echo "  ║  Server IP : 192.168.56.1                            ║"
+echo "  ║  DHCP Range: 192.168.56.50 – 192.168.56.100         ║"
+echo "  ╚══════════════════════════════════════════════════════╝"
 echo ""
 
 # ════════════════════════════════════════════════════════════
-#  PHASE 2 — WIPE EVERYTHING
+#  PHASE 1 — WIPE EVERYTHING
 # ════════════════════════════════════════════════════════════
-banner "PHASE 2 — WIPING PREVIOUS INSTALLS"
+banner "PHASE 1 — WIPING PREVIOUS INSTALLS"
 
-info "Stopping services..."
+info "Stopping any running services..."
 systemctl stop isc-dhcp-server 2>/dev/null || true
 systemctl stop ssh             2>/dev/null || true
+systemctl disable isc-dhcp-server 2>/dev/null || true
+systemctl disable ssh             2>/dev/null || true
 
 info "Purging packages..."
-apt-get purge -y openssh-server isc-dhcp-server isc-dhcp-common ifupdown 2>/dev/null || true
+apt-get purge -y openssh-server openssh-client isc-dhcp-server isc-dhcp-common ifupdown 2>/dev/null || true
 apt-get autoremove -y 2>/dev/null || true
 success "Packages purged."
 
-info "Removing old config files..."
-rm -f /etc/ssh/sshd_config* /etc/motd
-rm -f /etc/dhcp/dhcpd.conf* /etc/default/isc-dhcp-server*
-rm -f /var/lib/dhcp/dhcpd.leases 2>/dev/null || true
-mkdir -p /var/lib/dhcp && touch /var/lib/dhcp/dhcpd.leases
+info "Deleting all old config files..."
+rm -f  /etc/ssh/sshd_config*
+rm -f  /etc/motd
+rm -f  /etc/dhcp/dhcpd.conf*
+rm -f  /etc/default/isc-dhcp-server*
+rm -rf /var/lib/dhcp/
+mkdir -p /var/lib/dhcp
+touch /var/lib/dhcp/dhcpd.leases
+success "Old configs deleted."
 
-# Reset interfaces file to loopback only
+info "Resetting /etc/network/interfaces to loopback only..."
 cat > /etc/network/interfaces <<'EOF'
 # /etc/network/interfaces
 source /etc/network/interfaces.d/*
@@ -130,23 +82,32 @@ source /etc/network/interfaces.d/*
 auto lo
 iface lo inet loopback
 EOF
-success "All old configs deleted."
+success "interfaces file reset."
+
+info "Flushing IPs on both interfaces..."
+ip addr flush dev "$HOSTONLY" 2>/dev/null || true
+ip addr flush dev "$NAT"      2>/dev/null || true
+ip link set "$HOSTONLY" down  2>/dev/null || true
+ip link set "$NAT"      down  2>/dev/null || true
+success "Interfaces flushed."
 
 # ════════════════════════════════════════════════════════════
-#  PHASE 3 — FIX APT SOURCES
+#  PHASE 2 — FIX APT SOURCES
 # ════════════════════════════════════════════════════════════
-banner "PHASE 3 — FIXING APT SOURCES"
+banner "PHASE 2 — FIXING APT SOURCES"
 
 SOURCES="/etc/apt/sources.list"
 
-info "Removing all cdrom entries..."
+info "Nuking all cdrom lines..."
 grep -vi "cdrom" "$SOURCES" > /tmp/sources.clean 2>/dev/null || true
 mv /tmp/sources.clean "$SOURCES"
+success "cdrom entries removed."
 
-info "Disabling all sources.list.d files..."
+info "Disabling all sources.list.d entries..."
 for f in /etc/apt/sources.list.d/*.list; do
   [[ -f "$f" ]] && mv "$f" "${f}.disabled" && warn "Disabled: $f"
 done
+success "sources.list.d cleaned."
 
 info "Writing clean Debian 13 Trixie mirrors..."
 cat > "$SOURCES" <<'EOF'
@@ -158,63 +119,87 @@ EOF
 success "Clean sources.list written."
 
 # ════════════════════════════════════════════════════════════
-#  PHASE 4 — UPDATE AND INSTALL (using NAT interface)
+#  PHASE 3 — BRING UP NAT FOR INTERNET
 # ════════════════════════════════════════════════════════════
-banner "PHASE 4 — INSTALLING PACKAGES (via $NAT_IFACE NAT)"
+banner "PHASE 3 — INTERNET VIA $NAT (NAT)"
 
-if ping -c 2 -W 3 8.8.8.8 &>/dev/null; then
-  success "Internet reachable via $NAT_IFACE."
+info "Bringing up $NAT via DHCP..."
+ip link set "$NAT" up
+dhclient "$NAT" 2>/dev/null || true
+sleep 3
+
+NAT_IP=$(ip -4 addr show "$NAT" 2>/dev/null | awk '/inet / {print $2}' | head -1)
+if [[ -n "$NAT_IP" ]]; then
+  success "$NAT got IP: $NAT_IP"
 else
-  warn "No internet detected. Trying apt-get update anyway..."
+  warn "Could not get IP on $NAT. Make sure Adapter 2 = NAT in VirtualBox."
 fi
 
+if ping -c 2 -W 3 8.8.8.8 &>/dev/null; then
+  success "Internet reachable."
+else
+  warn "No internet ping. apt-get update may fail."
+fi
+
+# ════════════════════════════════════════════════════════════
+#  PHASE 4 — UPDATE AND INSTALL
+# ════════════════════════════════════════════════════════════
+banner "PHASE 4 — INSTALLING PACKAGES"
+
 info "Running apt-get update..."
-apt-get update -y || error "apt-get update failed. Check Adapter 2 is set to NAT in VirtualBox."
+apt-get update -y || error "apt-get update failed. Check Adapter 2 is NAT in VirtualBox."
 success "Package list updated."
 
 info "Installing packages..."
 apt-get install -y openssh-server isc-dhcp-server net-tools ifupdown || \
-  error "Install failed."
-success "openssh-server, isc-dhcp-server, net-tools, ifupdown installed."
+  error "Package install failed."
+success "All packages installed."
 
 # ════════════════════════════════════════════════════════════
-#  PHASE 5 — SET STATIC IP ON HOST-ONLY INTERFACE
+#  PHASE 5 — STATIC IP ON HOST-ONLY (enp0s3)
 # ════════════════════════════════════════════════════════════
-banner "PHASE 5 — STATIC IP ON $IFACE (Host-Only)"
+banner "PHASE 5 — STATIC IP ON $HOSTONLY (Host-Only)"
 
-info "Flushing $IFACE and assigning $SERVER_IP..."
-ip addr flush dev "$IFACE" 2>/dev/null || true
-ip addr add "$SERVER_IP/$PREFIX" broadcast "$BROADCAST" dev "$IFACE"
-ip link set "$IFACE" up
+info "Assigning $SERVER_IP to $HOSTONLY..."
+ip link set "$HOSTONLY" up
+sleep 1
+ip addr flush dev "$HOSTONLY" 2>/dev/null || true
+ip addr add "$SERVER_IP/$PREFIX" broadcast "$BROADCAST" dev "$HOSTONLY"
 sleep 1
 
-ip addr show "$IFACE" | grep -q "inet $SERVER_IP" \
-  && success "Static IP $SERVER_IP/$PREFIX confirmed on $IFACE." \
-  || error "Failed to assign $SERVER_IP to $IFACE."
+if ip addr show "$HOSTONLY" | grep -q "inet $SERVER_IP"; then
+  success "Static IP $SERVER_IP confirmed on $HOSTONLY."
+else
+  error "Failed to assign $SERVER_IP to $HOSTONLY. Run: ip a"
+fi
 
-# Persist to /etc/network/interfaces
+info "Persisting static IP to /etc/network/interfaces..."
 cat >> /etc/network/interfaces <<EOF
 
-# $IFACE — ADAM SANJAYA XI TJKT 2 — Host-Only Static IP
-auto $IFACE
-iface $IFACE inet static
+# enp0s3 — ADAM SANJAYA XI TJKT 2 — Host-Only Static IP
+auto $HOSTONLY
+iface $HOSTONLY inet static
     address   $SERVER_IP
     netmask   $NETMASK
     broadcast $BROADCAST
+
+# enp0s8 — ADAM SANJAYA XI TJKT 2 — NAT (DHCP)
+auto $NAT
+iface $NAT inet dhcp
 EOF
-success "Static IP persisted to /etc/network/interfaces."
+success "interfaces file updated."
 
 # ════════════════════════════════════════════════════════════
-#  PHASE 6 — CONFIGURE DHCP SERVER
+#  PHASE 6 — DHCP SERVER CONFIG
 # ════════════════════════════════════════════════════════════
-banner "PHASE 6 — DHCP CONFIG"
+banner "PHASE 6 — DHCP SERVER CONFIG"
 
 info "Writing /etc/dhcp/dhcpd.conf..."
 cat > /etc/dhcp/dhcpd.conf <<EOF
 # ============================================================
 #  dhcpd.conf — ADAM SANJAYA XI TJKT 2
-#  Server    : $SERVER_IP
-#  Interface : $IFACE (Host-Only)
+#  Server IP : $SERVER_IP
+#  Interface : $HOSTONLY (Host-Only)
 #  Range     : $RANGE_START – $RANGE_END (51 hosts)
 # ============================================================
 
@@ -239,20 +224,20 @@ subnet $SUBNET netmask $NETMASK {
 EOF
 success "dhcpd.conf written."
 
-info "Binding DHCP server to $IFACE..."
+info "Binding DHCP to $HOSTONLY..."
 cat > /etc/default/isc-dhcp-server <<EOF
 # ADAM SANJAYA XI TJKT 2
-INTERFACESv4="$IFACE"
+INTERFACESv4="$HOSTONLY"
 INTERFACESv6=""
 EOF
-success "DHCP bound to $IFACE."
+success "DHCP bound to $HOSTONLY."
 
 # ════════════════════════════════════════════════════════════
-#  PHASE 7 — CONFIGURE OPENSSH
+#  PHASE 7 — SSH CONFIG
 # ════════════════════════════════════════════════════════════
 banner "PHASE 7 — SSH CONFIG"
 
-info "Writing fresh /etc/ssh/sshd_config..."
+info "Writing /etc/ssh/sshd_config..."
 cat > /etc/ssh/sshd_config <<'EOF'
 # sshd_config — ADAM SANJAYA XI TJKT 2
 Port 22
@@ -302,13 +287,13 @@ systemctl restart ssh
 sleep 1
 systemctl is-active --quiet ssh \
   && success "ssh             → RUNNING ✓" \
-  || warn    "ssh             → FAILED  (systemctl status ssh)"
+  || warn    "ssh → FAILED  (systemctl status ssh)"
 
-# Re-verify IP before DHCP start
-if ! ip addr show "$IFACE" | grep -q "inet $SERVER_IP"; then
-  warn "IP lost — re-applying $SERVER_IP..."
-  ip addr add "$SERVER_IP/$PREFIX" broadcast "$BROADCAST" dev "$IFACE"
-  ip link set "$IFACE" up
+# Verify IP still on interface before DHCP starts
+if ! ip addr show "$HOSTONLY" | grep -q "inet $SERVER_IP"; then
+  warn "IP gone — re-applying..."
+  ip addr add "$SERVER_IP/$PREFIX" broadcast "$BROADCAST" dev "$HOSTONLY"
+  ip link set "$HOSTONLY" up
   sleep 1
 fi
 
@@ -320,8 +305,7 @@ sleep 2
 systemctl is-active --quiet isc-dhcp-server \
   && success "isc-dhcp-server → RUNNING ✓" \
   || {
-    warn "isc-dhcp-server → FAILED"
-    echo ""
+    warn "isc-dhcp-server → FAILED. Logs:"
     journalctl -u isc-dhcp-server --no-pager -n 15
   }
 
@@ -342,13 +326,12 @@ echo "  ╔═══════════════════════
 echo -e "  ║  ${G}SETUP COMPLETE — ADAM SANJAYA XI TJKT 2${N}             ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo ""
-echo -e "  ${C}Host-Only Interface :${N} $IFACE"
-echo -e "  ${C}NAT Interface       :${N} $NAT_IFACE"
-echo -e "  ${C}Server IP           :${N} $SERVER_IP"
-echo -e "  ${C}SSH Port            :${N} 22"
-echo -e "  ${C}DHCP Range          :${N} $RANGE_START – $RANGE_END (51 hosts)"
-echo -e "  ${C}Lease Default/Min/Max:${N} ${DEFAULT_LEASE}s / ${MIN_LEASE}s / ${MAX_LEASE}s"
-echo -e "  ${C}Domain              :${N} adamsanjaya.local"
+echo -e "  ${C}Host-Only (DHCP) :${N} $HOSTONLY → $SERVER_IP"
+echo -e "  ${C}NAT (Internet)   :${N} $NAT → $NAT_IP"
+echo -e "  ${C}DHCP Range       :${N} $RANGE_START – $RANGE_END  (51 hosts)"
+echo -e "  ${C}Lease Times      :${N} Default 1h | Min 10m | Max 2h"
+echo -e "  ${C}SSH Port         :${N} 22"
+echo -e "  ${C}Domain           :${N} adamsanjaya.local"
 echo ""
 echo -e "  ${Y}PuTTY / CMD:${N}"
 echo -e "    Host : $SERVER_IP   Port : 22"
